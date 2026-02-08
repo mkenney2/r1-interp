@@ -12,5 +12,5 @@ training_tokens: 200000000   # 200M
 batch_size: 32               # sequences, not tokens
 warmup_steps: 1000
 
-dataset: HuggingFaceFW/fineweb-edu-score-2
+dataset: Skylion007/openwebtext
 wandb_project: r1-interp-sweep

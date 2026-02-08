@@ -60,9 +60,9 @@ class SweepConfig:
     skip_connection: bool = True
     learning_rate: float = 3e-4
     training_tokens: int = 200_000_000
-    batch_size: int = 4096
+    batch_size: int = 32  # sequences, not tokens (sparsify default)
     warmup_steps: int = 1000
-    dataset: str = "open-r1/OpenR1-Math-220k"
+    dataset: str = "Skylion007/openwebtext"
     wandb_project: str = "r1-interp-sweep"
 
     def generate_configs(self) -> list[dict[str, Any]]:
@@ -105,7 +105,7 @@ class TrainRunConfig:
         default_factory=TranscoderHyperparams
     )
     layers: tuple[int, ...] = tuple(range(N_LAYERS))
-    dataset: str = "open-r1/OpenR1-Math-220k"
+    dataset: str = "Skylion007/openwebtext"
     wandb_project: str = "r1-interp-train"
     checkpoint_dir: str = "checkpoints"
     distribute_modules: bool = True
