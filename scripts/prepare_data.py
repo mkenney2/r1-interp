@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
 """Phase 0 — Download and pre-tokenize training corpus.
 
-Downloads OpenR1-Math (or a specified dataset), tokenizes with the Qwen
+Downloads OpenR1-Math + a supplemental dataset, tokenizes with the Qwen
 tokenizer, and saves as a memory-mapped NumPy array for fast data loading
 during transcoder training.
 
 Usage:
-    python scripts/prepare_data.py [--dataset open-r1/OpenR1-Math-220k]
-                                   [--max-tokens 500000000]
+    python scripts/prepare_data.py [--max-tokens 200000000]
                                    [--eval-fraction 0.02]
                                    [--output-dir data/tokenized]
 """
@@ -15,16 +14,23 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
 
 import numpy as np
 from tqdm import tqdm
 
 MODEL_ID = "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"
-DEFAULT_DATASET = "open-r1/OpenR1-Math-220k"
 DEFAULT_OUTPUT_DIR = Path("data/tokenized")
-DEFAULT_MAX_TOKENS = 500_000_000  # 500M
+DEFAULT_MAX_TOKENS = 200_000_000  # 200M
 DEFAULT_EVAL_FRACTION = 0.02
+
+# Datasets to concatenate, in order. Each entry is (hf_name, split).
+# OpenR1-Math for reasoning-heavy content, then LMSYS-Chat to fill up to target.
+DEFAULT_DATASETS = [
+    ("open-r1/OpenR1-Math-220k", "train"),
+    ("lmsys/lmsys-chat-1m", "train"),
+]
 
 
 def load_dataset_streaming(dataset_name: str, split: str = "train"):
@@ -36,26 +42,42 @@ def load_dataset_streaming(dataset_name: str, split: str = "train"):
 
 
 def get_text_field(example: dict) -> str:
-    """Extract text from a dataset example, trying common field names."""
-    for field in ("text", "content", "problem", "question", "instruction"):
+    """Extract all available text from a dataset example.
+
+    For OpenR1-Math: concatenates problem + generated_solution.
+    For LMSYS-Chat: extracts conversation turns.
+    Falls back to joining all string fields.
+    """
+    # OpenR1-Math style: problem + solution fields
+    if "problem" in example:
+        parts = [str(example["problem"])]
+        for key in ("generated_solution", "solution", "answer"):
+            if key in example and example[key]:
+                parts.append(str(example[key]))
+        return "\n".join(parts)
+
+    # LMSYS-Chat style: conversation list
+    if "conversation" in example and isinstance(example["conversation"], list):
+        turns = []
+        for turn in example["conversation"]:
+            if isinstance(turn, dict) and "content" in turn:
+                turns.append(str(turn["content"]))
+            elif isinstance(turn, str):
+                turns.append(turn)
+        if turns:
+            return "\n".join(turns)
+
+    # Generic: try common single-text fields
+    for field in ("text", "content", "instruction", "question"):
         if field in example and example[field]:
             return str(example[field])
-    # For OpenR1-Math: concatenate problem + solution if both exist
-    parts = []
-    if "problem" in example:
-        parts.append(str(example["problem"]))
-    if "solution" in example:
-        parts.append(str(example["solution"]))
-    if "generated_solution" in example:
-        parts.append(str(example["generated_solution"]))
-    if parts:
-        return "\n".join(parts)
+
     # Last resort: join all string values
     return "\n".join(str(v) for v in example.values() if isinstance(v, str))
 
 
 def tokenize_and_save(
-    dataset_name: str,
+    datasets: list[tuple[str, str]],
     output_dir: Path,
     max_tokens: int,
     eval_fraction: float,
@@ -69,28 +91,51 @@ def tokenize_and_save(
     print(f"Loading tokenizer for {MODEL_ID}...")
     tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, trust_remote_code=True)
 
-    # Stream and tokenize
-    print(f"Streaming {dataset_name}...")
-    ds = load_dataset_streaming(dataset_name)
-
     all_tokens: list[int] = []
     n_examples = 0
+    dataset_stats: list[dict] = []
 
     pbar = tqdm(total=max_tokens, unit="tok", desc="Tokenizing")
-    for example in ds:
-        text = get_text_field(example)
-        if not text.strip():
-            continue
-        token_ids = tokenizer.encode(text, add_special_tokens=False)
-        all_tokens.extend(token_ids)
-        n_examples += 1
-        pbar.update(len(token_ids))
+
+    for dataset_name, split in datasets:
         if len(all_tokens) >= max_tokens:
-            all_tokens = all_tokens[:max_tokens]
             break
+
+        tokens_before = len(all_tokens)
+        examples_before = n_examples
+        print(f"\nStreaming {dataset_name} (split={split})...")
+
+        try:
+            ds = load_dataset_streaming(dataset_name, split=split)
+        except Exception as e:
+            print(f"  WARNING: Failed to load {dataset_name}: {e}")
+            continue
+
+        for example in ds:
+            text = get_text_field(example)
+            if not text.strip():
+                continue
+            token_ids = tokenizer.encode(text, add_special_tokens=False)
+            all_tokens.extend(token_ids)
+            n_examples += 1
+            pbar.update(len(token_ids))
+            if len(all_tokens) >= max_tokens:
+                all_tokens = all_tokens[:max_tokens]
+                break
+
+        tokens_from_ds = len(all_tokens) - tokens_before
+        examples_from_ds = n_examples - examples_before
+        dataset_stats.append({
+            "dataset": dataset_name,
+            "split": split,
+            "examples": examples_from_ds,
+            "tokens": tokens_from_ds,
+        })
+        print(f"  Got {examples_from_ds:,} examples, {tokens_from_ds:,} tokens")
+
     pbar.close()
 
-    print(f"Tokenized {n_examples} examples -> {len(all_tokens):,} tokens")
+    print(f"\nTotal: {n_examples:,} examples -> {len(all_tokens):,} tokens")
 
     # Convert to numpy
     token_array = np.array(all_tokens, dtype=np.int32)
@@ -111,7 +156,7 @@ def tokenize_and_save(
 
     # Save metadata
     meta = {
-        "dataset": dataset_name,
+        "datasets": dataset_stats,
         "model_id": MODEL_ID,
         "vocab_size": tokenizer.vocab_size,
         "total_tokens": len(token_array),
@@ -120,7 +165,6 @@ def tokenize_and_save(
         "n_examples": n_examples,
         "dtype": "int32",
     }
-    import json
 
     with open(output_dir / "metadata.json", "w") as f:
         json.dump(meta, f, indent=2)
@@ -134,9 +178,10 @@ def tokenize_and_save(
 def main() -> None:
     parser = argparse.ArgumentParser(description="Pre-tokenize training corpus")
     parser.add_argument(
-        "--dataset",
-        default=DEFAULT_DATASET,
-        help=f"HuggingFace dataset name (default: {DEFAULT_DATASET})",
+        "--datasets",
+        nargs="*",
+        default=None,
+        help="HuggingFace dataset names (default: OpenR1-Math + LMSYS-Chat)",
     )
     parser.add_argument(
         "--max-tokens",
@@ -158,8 +203,13 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    if args.datasets:
+        datasets = [(d, "train") for d in args.datasets]
+    else:
+        datasets = DEFAULT_DATASETS
+
     tokenize_and_save(
-        dataset_name=args.dataset,
+        datasets=datasets,
         output_dir=args.output_dir,
         max_tokens=args.max_tokens,
         eval_fraction=args.eval_fraction,
