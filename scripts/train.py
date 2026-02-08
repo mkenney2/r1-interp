@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -54,25 +55,29 @@ def build_sparsify_command(
         "--transcode",
         "--expansion_factor",
         str(hp.expansion_factor),
-        "--k",
+        "-k",
         str(hp.top_k),
         "--layers",
         str(layer),
-        "--lr",
-        str(hp.learning_rate),
-        "--num_tokens",
-        str(hp.training_tokens),
         "--batch_size",
         str(hp.batch_size),
-        "--warmup_steps",
+        "--lr_warmup_steps",
         str(hp.warmup_steps),
     ]
+    if hp.learning_rate is not None:
+        cmd.extend(["--lr", str(hp.learning_rate)])
     if hp.skip_connection:
         cmd.append("--skip_connection")
-    cmd.extend(["--wandb_project", wandb_project])
     cmd.extend(["--run_name", f"{run_name}_L{layer}"])
     cmd.extend(["--save_dir", checkpoint_dir])
     return cmd
+
+
+def build_sparsify_env(wandb_project: str) -> dict[str, str]:
+    """Build environment variables for sparsify (e.g. WANDB_PROJECT)."""
+    env = dict(os.environ)
+    env["WANDB_PROJECT"] = wandb_project
+    return env
 
 
 def train_layer(
@@ -99,7 +104,8 @@ def train_layer(
     print(f"Command: {cmd_str}")
     print(f"{'='*60}\n")
 
-    result = subprocess.run(cmd)
+    env = build_sparsify_env(wandb_project)
+    result = subprocess.run(cmd, env=env)
     return result.returncode
 
 

@@ -76,7 +76,7 @@ def run_sweep(
                 "--config", "/dev/null",  # we pass args directly below
             ]
             # Build sparsify command directly
-            from scripts.train import build_sparsify_command
+            from scripts.train import build_sparsify_command, build_sparsify_env
 
             cmd = build_sparsify_command(
                 hp=hp,
@@ -86,6 +86,7 @@ def run_sweep(
                 run_name=run_name,
                 checkpoint_dir=ckpt_dir,
             )
+            env = build_sparsify_env(cfg["wandb_project"])
 
             if dry_run:
                 print(f"  [DRY RUN] L{layer}: {' '.join(cmd)}")
@@ -104,7 +105,7 @@ def run_sweep(
 
             # Run training
             print(f"  Training layer {layer}...")
-            train_result = subprocess.run(cmd)
+            train_result = subprocess.run(cmd, env=env)
             if train_result.returncode != 0:
                 print(f"  WARNING: Training failed for L{layer}, skipping eval")
                 continue
