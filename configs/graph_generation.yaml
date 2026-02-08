@@ -1,0 +1,14 @@
+# Phase 4: Attribution graph generation
+# Run: python scripts/generate_graphs.py --config configs/graph_generation.yaml
+
+type: GraphConfig
+
+node_threshold: 0.8
+edge_threshold: 0.98
+max_feature_nodes: 7500
+max_n_logits: 10
+desired_logit_prob: 0.95
+batch_size: 512
+prompts_file: data/prompts/benchmark_prompts.json
+output_dir: results/graphs
+transcoder_dir: checkpoints

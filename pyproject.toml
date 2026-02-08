@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "r1-interp"
+version = "0.1.0"
+description = "Interpretability toolkit for DeepSeek-R1-Distill-Qwen-1.5B"
+readme = "r1_interp_build_plan.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+dependencies = [
+    "torch>=2.0",
+    "transformers>=4.40",
+    "safetensors",
+    "pyyaml",
+    "wandb",
+    "datasets",
+    "numpy",
+    "tqdm",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov",
+    "igraph",
+]
+
+[tool.setuptools.packages.find]
+include = ["r1_interp*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-v --tb=short"

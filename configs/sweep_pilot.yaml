@@ -1,0 +1,16 @@
+# Phase 1: Hyperparameter sweep on 3 pilot layers
+# Run: python scripts/sweep.py --config configs/sweep_pilot.yaml
+
+type: SweepConfig
+
+layers: [2, 14, 26]
+expansion_factors: [32, 64, 128]
+top_k_values: [32, 64, 128]
+skip_connection: true
+learning_rate: 3.0e-4
+training_tokens: 200000000   # 200M
+batch_size: 4096
+warmup_steps: 1000
+
+dataset: open-r1/OpenR1-Math-220k
+wandb_project: r1-interp-sweep

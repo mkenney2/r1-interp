@@ -1,0 +1,14 @@
+# Phase 3: Automated interpretability (Claude API feature labeling)
+# Run: python scripts/autointerp.py --config configs/autointerp.yaml
+
+type: AutointerpConfig
+
+claude_model: claude-sonnet-4-5-20250929
+examples_per_feature: 20
+min_activation_freq: 0.001   # 0.1%
+batch_size: 50
+max_concurrent_requests: 10
+output_dir: results/features
+transcoder_dir: checkpoints
+corpus_dataset: open-r1/OpenR1-Math-220k
+corpus_tokens: 50000000      # 50M

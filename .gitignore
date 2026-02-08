@@ -1,0 +1,47 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Project outputs (large / generated)
+results/
+checkpoints/
+*.pt
+*.safetensors
+*.bin
+*.memmap
+*.npy
+
+# Data (downloaded)
+data/tokenized/
+data/raw/
+
+# Secrets
+.env
+credentials.json
+
+# OS
+.DS_Store
+Thumbs.db
+nul
+
+# Experiment tracking
+wandb/
+
+# Jupyter
+.ipynb_checkpoints/
