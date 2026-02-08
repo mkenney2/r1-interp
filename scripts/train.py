@@ -67,6 +67,12 @@ def build_sparsify_command(
         "--text_column",
         text_column,
     ]
+    # Limit training length: --max_examples caps sequences, not tokens
+    # With default ctx_len=2048, max_examples = training_tokens / 2048
+    if hp.training_tokens is not None:
+        ctx_len = 2048
+        max_examples = hp.training_tokens // ctx_len
+        cmd.extend(["--max_examples", str(max_examples)])
     if hp.learning_rate is not None:
         cmd.extend(["--lr", str(hp.learning_rate)])
     if hp.skip_connection:
