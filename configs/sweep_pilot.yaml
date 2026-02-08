@@ -12,5 +12,5 @@ training_tokens: 200000000   # 200M
 batch_size: 32               # sequences, not tokens
 warmup_steps: 1000
 
-dataset: open-r1/OpenR1-Math-220k
+dataset: HuggingFaceFW/fineweb-edu-score-2
 wandb_project: r1-interp-sweep

@@ -44,6 +44,7 @@ def build_sparsify_command(
     wandb_project: str,
     run_name: str,
     checkpoint_dir: str,
+    text_column: str = "text",
 ) -> list[str]:
     """Build CLI args for sparsify training."""
     cmd = [
@@ -63,6 +64,8 @@ def build_sparsify_command(
         str(hp.batch_size),
         "--lr_warmup_steps",
         str(hp.warmup_steps),
+        "--text_column",
+        text_column,
     ]
     if hp.learning_rate is not None:
         cmd.extend(["--lr", str(hp.learning_rate)])
