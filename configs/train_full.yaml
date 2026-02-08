@@ -10,7 +10,7 @@ hyperparams:
   skip_connection: true
   learning_rate: 3.0e-4
   training_tokens: 200000000
-  batch_size: 4096
+  batch_size: 32               # sequences, not tokens
   warmup_steps: 1000
   weight_decay: 0.0
 

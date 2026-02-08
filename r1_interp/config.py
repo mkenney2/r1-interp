@@ -31,7 +31,7 @@ class TranscoderHyperparams:
     skip_connection: bool = True
     learning_rate: float = 3e-4
     training_tokens: int = 200_000_000  # 200M
-    batch_size: int = 4096
+    batch_size: int = 32  # sequences, not tokens (sparsify default)
     warmup_steps: int = 1000
     weight_decay: float = 0.0
 
