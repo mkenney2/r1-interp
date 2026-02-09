@@ -47,10 +47,11 @@ class Transcoder(torch.nn.Module):
         # Print shapes on first load for debugging
         print(f"    Transcoder weights: {', '.join(f'{k}: {v.shape}' for k, v in state.items())}")
 
-        self.W_enc = state["W_enc"]
+        # Sparsify uses encoder.weight/encoder.bias instead of W_enc/b_enc
+        self.W_enc = state.get("W_enc", state.get("encoder.weight"))
+        self.b_enc = state.get("b_enc", state.get("encoder.bias"))
         self.W_dec = state["W_dec"]
-        self.b_enc = state["b_enc"]
-        self.b_dec = state.get("b_dec", torch.zeros(self.W_dec.shape[0], device=device))
+        self.b_dec = state.get("b_dec", torch.zeros(self.W_dec.shape[-1], device=device))
         self.W_skip = state.get("W_skip", None)
 
         self.k = self.cfg.get("k", 64)
