@@ -138,6 +138,11 @@ def run_sweep(
                 )
             else:
                 print(f"  WARNING: Eval failed for L{layer}")
+                if eval_result.stderr:
+                    # Show last few lines of error for debugging
+                    err_lines = eval_result.stderr.strip().splitlines()
+                    for line in err_lines[-5:]:
+                        print(f"    {line}")
 
     # Save results to CSV
     if results:
