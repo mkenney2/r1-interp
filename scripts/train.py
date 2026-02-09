@@ -62,6 +62,8 @@ def build_sparsify_command(
         str(layer),
         "--batch_size",
         str(hp.batch_size),
+        "--grad_acc_steps",
+        str(hp.grad_acc_steps),
         "--lr_warmup_steps",
         str(hp.warmup_steps),
         "--text_column",
@@ -86,6 +88,10 @@ def build_sparsify_env(wandb_project: str) -> dict[str, str]:
     """Build environment variables for sparsify (e.g. WANDB_PROJECT)."""
     env = dict(os.environ)
     env["WANDB_PROJECT"] = wandb_project
+    # Reduce CUDA memory fragmentation
+    env.setdefault(
+        "PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True"
+    )
     return env
 
 

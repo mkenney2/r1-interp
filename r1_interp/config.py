@@ -31,7 +31,8 @@ class TranscoderHyperparams:
     skip_connection: bool = True
     learning_rate: float = 3e-4
     training_tokens: int = 200_000_000  # 200M
-    batch_size: int = 32  # sequences, not tokens (sparsify default)
+    batch_size: int = 8  # micro-batch sequences (use grad_acc for effective batch)
+    grad_acc_steps: int = 4  # effective batch = batch_size * grad_acc_steps
     warmup_steps: int = 1000
     weight_decay: float = 0.0
 
@@ -60,7 +61,8 @@ class SweepConfig:
     skip_connection: bool = True
     learning_rate: float = 3e-4
     training_tokens: int = 200_000_000
-    batch_size: int = 32  # sequences, not tokens (sparsify default)
+    batch_size: int = 8  # micro-batch sequences (use grad_acc for effective batch)
+    grad_acc_steps: int = 4  # effective batch = batch_size * grad_acc_steps
     warmup_steps: int = 1000
     dataset: str = "Skylion007/openwebtext"
     wandb_project: str = "r1-interp-sweep"
@@ -80,6 +82,7 @@ class SweepConfig:
                 learning_rate=self.learning_rate,
                 training_tokens=self.training_tokens,
                 batch_size=self.batch_size,
+                grad_acc_steps=self.grad_acc_steps,
                 warmup_steps=self.warmup_steps,
             )
             configs.append(
