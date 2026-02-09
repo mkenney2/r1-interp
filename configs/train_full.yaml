@@ -1,12 +1,14 @@
 # Phase 2: Full transcoder training for all 28 layers
-# Hyperparams are placeholders — update with sweep winners from Phase 1.
+# Sweep winners: exp=32, k=64 (CE incr=0.020, dead=34%, L0=64)
 # Run: python scripts/train.py --config configs/train_full.yaml
+#
+# Estimated time: ~6 hours/layer × 28 layers = ~7 days on 1× A100 80GB
 
 type: TrainRunConfig
 
 hyperparams:
-  expansion_factor: 64       # UPDATE after sweep
-  top_k: 64                  # UPDATE after sweep
+  expansion_factor: 32       # sweep winner
+  top_k: 64                  # sweep winner
   skip_connection: true
   learning_rate: 3.0e-4
   training_tokens: 200000000
@@ -21,4 +23,4 @@ dataset: Skylion007/openwebtext
 wandb_project: r1-interp-train
 checkpoint_dir: checkpoints
 distribute_modules: true
-num_gpus: 8
+num_gpus: 1
