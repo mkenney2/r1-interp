@@ -43,6 +43,8 @@ class Transcoder(torch.nn.Module):
             self.cfg = json.load(f)
 
         state = load_file(str(weights_path), device=device)
+        # Cast to bf16 to match model dtype
+        state = {k: v.bfloat16() for k, v in state.items()}
 
         # Print shapes on first load for debugging
         print(f"    Transcoder weights: {', '.join(f'{k}: {v.shape}' for k, v in state.items())}")
