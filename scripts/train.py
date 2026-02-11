@@ -181,6 +181,12 @@ def main() -> None:
         help="Train a single layer (overrides config)",
     )
     parser.add_argument(
+        "--lr",
+        type=float,
+        default=None,
+        help="Override learning rate from config",
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Print commands without executing",
@@ -199,11 +205,17 @@ def main() -> None:
 
     ensure_dir(cfg.checkpoint_dir)
 
+    hp = cfg.hyperparams
+    # Apply CLI overrides (frozen dataclass — recreate with replaced field)
+    if args.lr is not None:
+        from dataclasses import replace
+        hp = replace(hp, learning_rate=args.lr)
+
     layers = [args.layer] if args.layer is not None else list(cfg.layers)
 
     if args.use_api:
         train_python_api(
-            hp=cfg.hyperparams,
+            hp=hp,
             layers=layers,
             dataset=cfg.dataset,
             wandb_project=cfg.wandb_project,
@@ -215,7 +227,7 @@ def main() -> None:
         failed_layers = []
         for layer in layers:
             rc = train_layer(
-                hp=cfg.hyperparams,
+                hp=hp,
                 layer=layer,
                 dataset=cfg.dataset,
                 wandb_project=cfg.wandb_project,
