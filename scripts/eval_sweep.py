@@ -89,22 +89,21 @@ class Transcoder(torch.nn.Module):
 # Checkpoint discovery
 # ---------------------------------------------------------------------------
 def find_checkpoints(base_dir: Path) -> list[dict]:
-    """Find all valid sweep checkpoints."""
+    """Find all valid checkpoints (sweep or full training layout)."""
     checkpoints = []
     for run_dir in sorted(base_dir.iterdir()):
-        if not run_dir.is_dir() or not run_dir.name.startswith("sweep_"):
+        if not run_dir.is_dir():
             continue
 
-        # Parse config from dir name: sweep_exp{N}_k{K}_lr{LR}
-        name = run_dir.name.replace("sweep_", "")
-        parts = name.split("_")
-        try:
-            exp = int(parts[0].replace("exp", ""))
-            k = int(parts[1].replace("k", ""))
-        except (ValueError, IndexError):
+        # Parse expansion/topk from dir name (sweep_exp{N}_k{K}_... or train_full_exp{N}_k{K}_...)
+        import re
+        m = re.search(r"exp(\d+)_k(\d+)", run_dir.name)
+        if not m:
             continue
+        exp = int(m.group(1))
+        k = int(m.group(2))
 
-        # Find per-layer checkpoint subdirs
+        # Find per-layer checkpoint subdirs (contain _L{N} suffix)
         for layer_dir in sorted(run_dir.iterdir()):
             if not layer_dir.is_dir() or "_L" not in layer_dir.name:
                 continue
