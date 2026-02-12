@@ -112,6 +112,7 @@ def load_model_with_transcoders(transcoder_dir: str, device: torch.device):
     """Load R1-distill model with transcoders via circuit-tracer.
 
     Uses TransformerLens monkey-patch + pre-loaded HF weights.
+    Loads transcoders from local directory (bypasses HuggingFace download).
     """
     from transformers import AutoModelForCausalLM
 
@@ -119,9 +120,33 @@ def load_model_with_transcoders(transcoder_dir: str, device: torch.device):
 
     try:
         from circuit_tracer import ReplacementModel
+        from circuit_tracer.transcoder.single_layer_transcoder import load_transcoder_set
     except ImportError:
         print("ERROR: circuit-tracer not installed.")
         sys.exit(1)
+
+    # Load transcoders from local directory
+    tc_path = Path(transcoder_dir)
+    transcoder_paths = {}
+    for f in sorted(tc_path.glob("layer_*.safetensors")):
+        layer_num = int(f.stem.split("_")[1])
+        transcoder_paths[layer_num] = str(f)
+
+    if not transcoder_paths:
+        print(f"ERROR: No layer_*.safetensors files found in {transcoder_dir}")
+        sys.exit(1)
+
+    print(f"Loading {len(transcoder_paths)} transcoders from {transcoder_dir} "
+          f"(layers {min(transcoder_paths)}–{max(transcoder_paths)})...")
+
+    transcoders = load_transcoder_set(
+        transcoder_paths,
+        scan="r1-interp",
+        feature_input_hook="hook_mlp_in",
+        feature_output_hook="hook_mlp_out",
+        dtype=torch.bfloat16,
+        device=device,
+    )
 
     # Pre-load R1 weights so TransformerLens uses them
     # instead of downloading Qwen2-1.5B weights
@@ -131,10 +156,10 @@ def load_model_with_transcoders(transcoder_dir: str, device: torch.device):
         torch_dtype=torch.bfloat16,
     )
 
-    print(f"Building ReplacementModel with transcoders from {transcoder_dir}...")
-    model = ReplacementModel.from_pretrained(
+    print("Building ReplacementModel...")
+    model = ReplacementModel.from_pretrained_and_transcoders(
         MODEL_ID,
-        transcoder_dir,
+        transcoders,
         device=device,
         dtype=torch.bfloat16,
         hf_model=hf_model,
