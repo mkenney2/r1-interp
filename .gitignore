@@ -45,3 +45,4 @@ wandb/
 
 # Jupyter
 .ipynb_checkpoints/
+results/features/activations/
