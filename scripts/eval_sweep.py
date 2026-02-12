@@ -89,22 +89,42 @@ class Transcoder(torch.nn.Module):
 # Checkpoint discovery
 # ---------------------------------------------------------------------------
 def find_checkpoints(base_dir: Path) -> list[dict]:
-    """Find all valid checkpoints (sweep or full training layout)."""
+    """Find all valid checkpoints (sweep or full training layout).
+
+    Supports two layouts:
+      Sweep:  base/sweep_exp32_k32_.../sweep_exp32_k32_..._L2/layers.2/sae.safetensors
+      Full:   base/train_full_exp32_k64_..._L0/layers.0/sae.safetensors
+    """
+    import re
+
     checkpoints = []
-    for run_dir in sorted(base_dir.iterdir()):
-        if not run_dir.is_dir():
+    for entry in sorted(base_dir.iterdir()):
+        if not entry.is_dir():
             continue
 
-        # Parse expansion/topk from dir name (sweep_exp{N}_k{K}_... or train_full_exp{N}_k{K}_...)
-        import re
-        m = re.search(r"exp(\d+)_k(\d+)", run_dir.name)
+        m = re.search(r"exp(\d+)_k(\d+)", entry.name)
         if not m:
             continue
         exp = int(m.group(1))
         k = int(m.group(2))
 
-        # Find per-layer checkpoint subdirs (contain _L{N} suffix)
-        for layer_dir in sorted(run_dir.iterdir()):
+        # Flat layout: dir itself has _L{N} and contains layers.{N}/
+        layer_m = re.search(r"_L(\d+)$", entry.name)
+        if layer_m:
+            layer = int(layer_m.group(1))
+            sae_dir = entry / f"layers.{layer}"
+            if (sae_dir / "sae.safetensors").exists():
+                checkpoints.append({
+                    "expansion_factor": exp,
+                    "top_k": k,
+                    "layer": layer,
+                    "sae_dir": sae_dir,
+                    "run_name": entry.name,
+                })
+            continue
+
+        # Nested layout: dir contains subdirs with _L{N}
+        for layer_dir in sorted(entry.iterdir()):
             if not layer_dir.is_dir() or "_L" not in layer_dir.name:
                 continue
             layer = int(layer_dir.name.split("_L")[-1])
@@ -116,7 +136,7 @@ def find_checkpoints(base_dir: Path) -> list[dict]:
                 "top_k": k,
                 "layer": layer,
                 "sae_dir": sae_dir,
-                "run_name": run_dir.name,
+                "run_name": entry.name,
             })
     return checkpoints
 
