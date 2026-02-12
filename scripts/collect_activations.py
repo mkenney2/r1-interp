@@ -4,6 +4,10 @@
 Runs the model on a diverse corpus, hooks transcoders into MLP layers,
 and records top-N activating examples per feature with context.
 
+OPTIMIZED: hooks ALL requested layers simultaneously so the corpus is
+processed in a single pass (10 layers → 10x fewer forward passes).
+Uses vectorized counting and heap-min filtering to minimize Python overhead.
+
 Output is saved as JSON per layer for downstream autointerp labeling.
 
 Usage:
@@ -12,7 +16,9 @@ Usage:
         --layers 8 9 10 11 12 13 14 15 16 17 \
         --output-dir results/features/activations \
         [--n-examples 20] \
-        [--corpus-tokens 5000000]
+        [--corpus-tokens 5000000] \
+        [--batch-size 32] \
+        [--seq-len 256]
 """
 
 from __future__ import annotations
@@ -22,6 +28,7 @@ import heapq
 import json
 import re
 import sys
+import time
 from collections import defaultdict
 from pathlib import Path
 
@@ -63,16 +70,16 @@ class Transcoder(torch.nn.Module):
         self.k = self.cfg.get("k", 64)
         self.n_features = self.W_enc.shape[0]
 
-    def encode(self, x: torch.Tensor) -> torch.Tensor:
-        """Encode to sparse activations."""
+    def encode_topk(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Encode to sparse topk activations. Returns (topk_vals, topk_idx).
+
+        This avoids materializing the full (batch, seq, n_features) dense tensor,
+        saving significant GPU memory.
+        """
         pre_acts = x @ self.W_enc.T + self.b_enc
         acts = F.relu(pre_acts)
-        if self.k > 0 and self.k < acts.shape[-1]:
-            topk_vals, topk_idx = acts.topk(self.k, dim=-1)
-            sparse_acts = torch.zeros_like(acts)
-            sparse_acts.scatter_(-1, topk_idx, topk_vals)
-            return sparse_acts
-        return acts
+        topk_vals, topk_idx = acts.topk(self.k, dim=-1)
+        return topk_vals, topk_idx
 
 
 # ---------------------------------------------------------------------------
@@ -117,113 +124,219 @@ def load_corpus_tokens(
 
 
 # ---------------------------------------------------------------------------
-# Activation collection
+# Optimized multi-layer activation collection
 # ---------------------------------------------------------------------------
-def collect_layer_activations(
+def collect_all_layers(
     model,
     tokenizer,
-    transcoder: Transcoder,
-    layer: int,
+    transcoders: dict[int, Transcoder],
     corpus_tokens: torch.Tensor,
     n_examples: int = 20,
-    batch_size: int = 8,
-    seq_len: int = 128,
-) -> dict:
-    """Collect top-activating examples for every feature in one layer."""
+    batch_size: int = 32,
+    seq_len: int = 256,
+) -> dict[int, dict]:
+    """Collect top-activating examples for ALL layers in a single corpus pass.
 
-    # Min-heap per feature: (activation_value, token_offset, context_snippet)
-    top_examples: dict[int, list] = defaultdict(list)
-    activation_count: dict[int, int] = defaultdict(int)
-    max_activation: dict[int, float] = defaultdict(float)
-    total_tokens_seen = 0
+    Key optimizations vs the per-layer version:
+    - Hooks all layers simultaneously → 1 pass instead of N
+    - Uses topk representation → no dense (batch, seq, 49152) tensor
+    - Vectorized counting via torch.bincount
+    - Heap-min filtering: only enters Python loop for features that can
+      beat the current top-N threshold
+    - Defers tokenizer.decode() to save time — stores raw token tuples
+    """
+    device = corpus_tokens.device
+
+    # Per-layer tracking state
+    layer_state = {}
+    for layer, tc in transcoders.items():
+        layer_state[layer] = {
+            "activation_count": torch.zeros(tc.n_features, dtype=torch.long),
+            "max_activation": torch.zeros(tc.n_features, dtype=torch.float32),
+            # Track heap minimum per feature for fast filtering
+            "heap_mins": torch.zeros(tc.n_features, dtype=torch.float32),
+            "heap_full": torch.zeros(tc.n_features, dtype=torch.bool),
+            "heaps": defaultdict(list),  # feat_idx -> min-heap of (val, offset, token_tuple)
+        }
 
     n_seqs = len(corpus_tokens) // seq_len
     tokens_2d = corpus_tokens[: n_seqs * seq_len].reshape(n_seqs, seq_len)
 
-    # Hook to capture activations (not replace output — just observe)
-    captured_acts = {}
+    # Register hooks for ALL layers at once
+    captured_acts: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+    handles = []
 
-    def hook_fn(module, input, output):
-        x = input[0]
-        with torch.no_grad():
-            sparse_acts = transcoder.encode(x)
-            captured_acts["acts"] = sparse_acts
-        # Return original output — don't modify model behavior
-        return output
+    for layer, tc in transcoders.items():
+        def make_hook(l, t):
+            def hook_fn(module, input, output):
+                x = input[0]
+                with torch.no_grad():
+                    topk_vals, topk_idx = t.encode_topk(x)
+                    captured_acts[l] = (topk_vals, topk_idx)
+                return output  # Don't modify model behavior
+            return hook_fn
 
-    mlp = model.model.layers[layer].mlp
-    handle = mlp.register_forward_hook(hook_fn)
+        mlp = model.model.layers[layer].mlp
+        handle = mlp.register_forward_hook(make_hook(layer, tc))
+        handles.append(handle)
 
-    for i in range(0, n_seqs, batch_size):
-        batch = tokens_2d[i : i + batch_size]
+    total_tokens = 0
+    t_start = time.time()
+
+    for batch_i in range(0, n_seqs, batch_size):
+        batch = tokens_2d[batch_i : batch_i + batch_size]
         if len(batch) == 0:
             break
+
+        B = batch.shape[0]
+        captured_acts.clear()
 
         with torch.no_grad():
             model(batch)
 
-        if "acts" not in captured_acts:
-            continue
+        # Process each layer's captured activations
+        for layer, tc in transcoders.items():
+            if layer not in captured_acts:
+                continue
 
-        layer_acts = captured_acts["acts"]  # (batch, seq_len, n_features)
+            topk_vals, topk_idx = captured_acts[layer]
+            # topk_vals: (B, seq_len, k), topk_idx: (B, seq_len, k)
+            st = layer_state[layer]
 
-        # Process each position
-        for b_idx in range(layer_acts.shape[0]):
-            for pos in range(layer_acts.shape[1]):
-                active_mask = layer_acts[b_idx, pos] > 0
-                active_indices = active_mask.nonzero(as_tuple=True)[0]
+            # --- Vectorized frequency counting ---
+            flat_idx = topk_idx.reshape(-1)       # (B * seq_len * k,)
+            flat_vals = topk_vals.reshape(-1)      # (B * seq_len * k,)
+            active_mask = flat_vals > 0
+            active_idx = flat_idx[active_mask]
 
-                for feat_idx_t in active_indices:
-                    feat_idx = feat_idx_t.item()
-                    val = layer_acts[b_idx, pos, feat_idx].item()
+            if len(active_idx) == 0:
+                continue
 
-                    activation_count[feat_idx] += 1
-                    max_activation[feat_idx] = max(
-                        max_activation[feat_idx], val
-                    )
+            # Count per feature
+            counts = torch.bincount(active_idx, minlength=tc.n_features)
+            st["activation_count"] += counts.cpu().long()
 
-                    # Context: decode surrounding tokens
-                    global_offset = (i + b_idx) * seq_len + pos
+            # Max per feature via scatter_reduce
+            batch_max = torch.zeros(tc.n_features, device=device, dtype=torch.float32)
+            batch_max.scatter_reduce_(
+                0, active_idx.long(),
+                flat_vals[active_mask].float(),
+                reduce="amax",
+            )
+            st["max_activation"] = torch.maximum(
+                st["max_activation"], batch_max.cpu()
+            )
+
+            # --- Smart heap updates ---
+            # Only process features where batch_max > current heap minimum
+            # (or heap isn't full yet)
+            heap_mins_dev = st["heap_mins"].to(device)
+            needs_update = batch_max.to(device) > heap_mins_dev
+            needs_update &= (batch_max.to(device) > 0)
+
+            # Also update features whose heaps aren't full yet
+            not_full_dev = ~st["heap_full"].to(device)
+            has_activations = counts.to(device) > 0
+            needs_update |= (not_full_dev & has_activations)
+
+            update_features = needs_update.nonzero(as_tuple=True)[0]
+
+            for f_idx_t in update_features:
+                f_idx = f_idx_t.item()
+                heap = st["heaps"][f_idx]
+                min_val = st["heap_mins"][f_idx].item()
+
+                # Find positions in this batch where feature f_idx is in the topk
+                feat_match = (topk_idx == f_idx)  # (B, S, k)
+                feat_active = feat_match & (topk_vals > max(min_val, 0))
+
+                if not feat_active.any():
+                    continue
+
+                # Get (b, s, k_slot) positions
+                positions = feat_active.nonzero(as_tuple=False)  # (N, 3)
+
+                for pos_entry in positions:
+                    b_idx = pos_entry[0].item()
+                    pos = pos_entry[1].item()
+                    k_slot = pos_entry[2].item()
+                    val = topk_vals[b_idx, pos, k_slot].item()
+
+                    if val <= 0:
+                        continue
+
+                    # Store raw token tuple (decode later at save time)
+                    global_offset = (batch_i + b_idx) * seq_len + pos
                     ctx_start = max(0, pos - 10)
                     ctx_end = min(seq_len, pos + 15)
-                    ctx_tokens = batch[b_idx][ctx_start:ctx_end].tolist()
-                    context = tokenizer.decode(ctx_tokens)
+                    ctx_tokens = tuple(batch[b_idx][ctx_start:ctx_end].tolist())
 
-                    entry = (val, global_offset, context)
-                    if len(top_examples[feat_idx]) < n_examples:
-                        heapq.heappush(top_examples[feat_idx], entry)
-                    elif val > top_examples[feat_idx][0][0]:
-                        heapq.heapreplace(top_examples[feat_idx], entry)
+                    entry = (val, global_offset, ctx_tokens)
+                    if len(heap) < n_examples:
+                        heapq.heappush(heap, entry)
+                        if len(heap) == n_examples:
+                            st["heap_full"][f_idx] = True
+                            st["heap_mins"][f_idx] = heap[0][0]
+                    elif val > heap[0][0]:
+                        heapq.heapreplace(heap, entry)
+                        st["heap_mins"][f_idx] = heap[0][0]
 
-        total_tokens_seen += batch.numel()
-        if total_tokens_seen % 500_000 < batch_size * seq_len:
-            print(f"    {total_tokens_seen:,} tokens processed...")
+        total_tokens += batch.numel()
+        elapsed = time.time() - t_start
+        tps = total_tokens / elapsed if elapsed > 0 else 0
+        if total_tokens % 500_000 < batch_size * seq_len:
+            print(
+                f"  {total_tokens:,} / {len(corpus_tokens):,} tokens "
+                f"({total_tokens/len(corpus_tokens):.0%}) — "
+                f"{tps:,.0f} tok/s — {elapsed:.0f}s elapsed"
+            )
 
-    handle.remove()
+    # Remove all hooks
+    for h in handles:
+        h.remove()
 
-    # Build output
-    layer_data = {
-        "layer": layer,
-        "total_tokens": total_tokens_seen,
-        "n_features": transcoder.n_features,
-        "n_active_features": len(activation_count),
-        "features": {},
-    }
+    elapsed = time.time() - t_start
+    print(f"\nCorpus pass complete: {total_tokens:,} tokens in {elapsed:.1f}s")
 
-    for feat_idx in sorted(activation_count.keys()):
-        freq = activation_count[feat_idx] / max(total_tokens_seen, 1)
-        examples = sorted(top_examples[feat_idx], key=lambda x: -x[0])
-        layer_data["features"][str(feat_idx)] = {
-            "activation_frequency": freq,
-            "max_activation": max_activation[feat_idx],
-            "activation_count": activation_count[feat_idx],
-            "top_examples": [
-                {"activation": e[0], "token_offset": e[1], "context": e[2]}
-                for e in examples
-            ],
+    # Build output per layer, decoding contexts now
+    results = {}
+    for layer, tc in transcoders.items():
+        st = layer_state[layer]
+        n_active = (st["activation_count"] > 0).sum().item()
+
+        layer_data = {
+            "layer": layer,
+            "total_tokens": total_tokens,
+            "n_features": tc.n_features,
+            "n_active_features": n_active,
+            "features": {},
         }
 
-    return layer_data
+        for f_idx in range(tc.n_features):
+            count = st["activation_count"][f_idx].item()
+            if count == 0:
+                continue
+
+            freq = count / max(total_tokens, 1)
+            examples = sorted(st["heaps"][f_idx], key=lambda x: -x[0])
+
+            layer_data["features"][str(f_idx)] = {
+                "activation_frequency": freq,
+                "max_activation": st["max_activation"][f_idx].item(),
+                "activation_count": count,
+                "top_examples": [
+                    {
+                        "activation": e[0],
+                        "token_offset": e[1],
+                        "context": tokenizer.decode(list(e[2])),
+                    }
+                    for e in examples
+                ],
+            }
+
+        results[layer] = layer_data
+
+    return results
 
 
 # ---------------------------------------------------------------------------
@@ -248,7 +361,8 @@ def main() -> None:
     )
     parser.add_argument("--n-examples", type=int, default=20)
     parser.add_argument("--corpus-tokens", type=int, default=5_000_000)
-    parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument("--seq-len", type=int, default=256)
     args = parser.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -265,45 +379,57 @@ def main() -> None:
     model.eval()
     tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, trust_remote_code=True)
 
-    # Load corpus
-    corpus_tokens = load_corpus_tokens(tokenizer, args.corpus_tokens, device)
-
-    # Process each layer
+    # Load ALL transcoders at once (~300MB each, ~3GB total for 10 layers)
+    print(f"\nLoading transcoders for layers {args.layers}...")
+    transcoders: dict[int, Transcoder] = {}
     for layer in args.layers:
-        print(f"\n{'='*60}")
-        print(f"Layer {layer}")
-        print(f"{'='*60}")
-
         sae_dir = find_layer_checkpoint(args.checkpoint_base, layer)
         if sae_dir is None:
             print(f"  No checkpoint found for layer {layer}, skipping")
             continue
+        tc = Transcoder(sae_dir, device=device)
+        transcoders[layer] = tc
+        print(f"  Layer {layer}: {tc.n_features} features, k={tc.k}")
 
-        transcoder = Transcoder(sae_dir, device=device)
-        print(f"  Loaded transcoder: {transcoder.n_features} features, k={transcoder.k}")
+    if not transcoders:
+        print("No transcoders loaded, exiting")
+        sys.exit(1)
 
-        layer_data = collect_layer_activations(
-            model,
-            tokenizer,
-            transcoder,
-            layer,
-            corpus_tokens,
-            n_examples=args.n_examples,
-            batch_size=args.batch_size,
-        )
+    print(f"\nLoaded {len(transcoders)} transcoders — hooking all layers simultaneously")
 
+    # Load corpus
+    corpus_tokens = load_corpus_tokens(tokenizer, args.corpus_tokens, device)
+
+    # Single pass through corpus for ALL layers
+    print(
+        f"\nProcessing {len(corpus_tokens):,} tokens "
+        f"(batch_size={args.batch_size}, seq_len={args.seq_len}, "
+        f"{len(transcoders)} layers hooked)..."
+    )
+    results = collect_all_layers(
+        model,
+        tokenizer,
+        transcoders,
+        corpus_tokens,
+        n_examples=args.n_examples,
+        batch_size=args.batch_size,
+        seq_len=args.seq_len,
+    )
+
+    # Save results per layer
+    print()
+    for layer, layer_data in sorted(results.items()):
         out_path = args.output_dir / f"activations_layer{layer}.json"
         with open(out_path, "w") as f:
             json.dump(layer_data, f, indent=2)
 
         n_active = layer_data["n_active_features"]
         n_total = layer_data["n_features"]
-        print(f"  Active features: {n_active}/{n_total} ({n_active/n_total:.1%})")
-        print(f"  Saved -> {out_path}")
+        print(f"  Layer {layer}: {n_active}/{n_total} active ({n_active/n_total:.1%}) -> {out_path}")
 
-        # Free GPU memory
-        del transcoder
-        torch.cuda.empty_cache()
+    # Free GPU memory
+    del transcoders
+    torch.cuda.empty_cache()
 
     print("\nDone! Run autointerp.py next to label features.")
 
