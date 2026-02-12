@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import traceback
 from pathlib import Path
 
 import torch
@@ -230,6 +231,9 @@ def load_model_with_transcoders(transcoder_dir: str, device: torch.device):
         device=device,
         dtype=torch.bfloat16,
         hf_model=hf_model,
+        # Required: circuit-tracer hooks rely on hook_mlp_in firing,
+        # but TransformerLens disables it by default to save memory.
+        use_hook_mlp_in=True,
     )
 
     return model
@@ -313,6 +317,7 @@ def generate_all_graphs(
 
         except Exception as e:
             print(f"  ERROR: {e}")
+            traceback.print_exc()
             results.append(
                 {
                     "prompt_id": prompt.prompt_id,
