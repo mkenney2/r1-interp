@@ -108,11 +108,47 @@ def export_graph_json(
     return json_path
 
 
+def _make_identity_transcoder(
+    d_model: int,
+    d_transcoder: int,
+    layer_idx: int,
+    has_skip: bool,
+    device: torch.device,
+    dtype: torch.dtype = torch.bfloat16,
+):
+    """Create a passthrough transcoder that produces zero features.
+
+    Uses very negative b_enc so ReLU kills all activations.
+    With W_skip = identity, output = input (identity passthrough).
+    """
+    import torch.nn.functional as F
+    from torch import nn
+    from circuit_tracer.transcoder.single_layer_transcoder import SingleLayerTranscoder
+
+    tc = SingleLayerTranscoder(
+        d_model=d_model,
+        d_transcoder=d_transcoder,
+        activation_function=F.relu,
+        layer_idx=layer_idx,
+        skip_connection=has_skip,
+        device=device,
+        dtype=dtype,
+    )
+    # Very negative bias → ReLU(x @ 0 + (-1e6)) = 0 → no features activate
+    tc.b_enc.data.fill_(-1e6)
+    if has_skip:
+        tc.W_skip.data.copy_(torch.eye(d_model, device=device, dtype=dtype))
+    return tc
+
+
 def load_model_with_transcoders(transcoder_dir: str, device: torch.device):
     """Load R1-distill model with transcoders via circuit-tracer.
 
     Uses TransformerLens monkey-patch + pre-loaded HF weights.
     Loads transcoders from local directory (bypasses HuggingFace download).
+
+    circuit-tracer requires transcoders for ALL model layers (0 to n_layers-1).
+    Layers without trained transcoders get identity passthrough dummies.
     """
     from transformers import AutoModelForCausalLM
 
@@ -120,32 +156,63 @@ def load_model_with_transcoders(transcoder_dir: str, device: torch.device):
 
     try:
         from circuit_tracer import ReplacementModel
-        from circuit_tracer.transcoder.single_layer_transcoder import load_transcoder_set
+        from circuit_tracer.transcoder.single_layer_transcoder import (
+            load_relu_transcoder,
+            TranscoderSet,
+        )
     except ImportError:
         print("ERROR: circuit-tracer not installed.")
         sys.exit(1)
 
-    # Load transcoders from local directory
+    # Discover available transcoder files
     tc_path = Path(transcoder_dir)
-    transcoder_paths = {}
+    tc_files = {}
     for f in sorted(tc_path.glob("layer_*.safetensors")):
         layer_num = int(f.stem.split("_")[1])
-        transcoder_paths[layer_num] = str(f)
+        tc_files[layer_num] = str(f)
 
-    if not transcoder_paths:
+    if not tc_files:
         print(f"ERROR: No layer_*.safetensors files found in {transcoder_dir}")
         sys.exit(1)
 
-    print(f"Loading {len(transcoder_paths)} transcoders from {transcoder_dir} "
-          f"(layers {min(transcoder_paths)}–{max(transcoder_paths)})...")
+    print(f"Loading {len(tc_files)} transcoders from {transcoder_dir} "
+          f"(layers {min(tc_files)}–{max(tc_files)})...")
 
-    transcoders = load_transcoder_set(
-        transcoder_paths,
-        scan="r1-interp",
+    # Load real transcoders
+    real_transcoders = {}
+    for layer, path in tc_files.items():
+        real_transcoders[layer] = load_relu_transcoder(
+            path, layer, device=device, dtype=torch.bfloat16,
+            lazy_encoder=True, lazy_decoder=True,
+        )
+
+    # Get dimensions from a real transcoder
+    sample_tc = next(iter(real_transcoders.values()))
+    d_model = sample_tc.d_model
+    d_transcoder = sample_tc.d_transcoder
+    has_skip = sample_tc.W_skip is not None
+
+    # Qwen2-1.5B has 28 layers — circuit-tracer needs all of them covered
+    N_MODEL_LAYERS = 28
+    all_transcoders = {}
+    n_dummy = 0
+    for layer in range(N_MODEL_LAYERS):
+        if layer in real_transcoders:
+            all_transcoders[layer] = real_transcoders[layer]
+        else:
+            all_transcoders[layer] = _make_identity_transcoder(
+                d_model, d_transcoder, layer, has_skip, device,
+            )
+            n_dummy += 1
+
+    print(f"  {len(real_transcoders)} real + {n_dummy} identity passthrough = "
+          f"{N_MODEL_LAYERS} total")
+
+    tc_set = TranscoderSet(
+        all_transcoders,
         feature_input_hook="hook_mlp_in",
         feature_output_hook="hook_mlp_out",
-        dtype=torch.bfloat16,
-        device=device,
+        scan="r1-interp",
     )
 
     # Pre-load R1 weights so TransformerLens uses them
@@ -159,7 +226,7 @@ def load_model_with_transcoders(transcoder_dir: str, device: torch.device):
     print("Building ReplacementModel...")
     model = ReplacementModel.from_pretrained_and_transcoders(
         MODEL_ID,
-        transcoders,
+        tc_set,
         device=device,
         dtype=torch.bfloat16,
         hf_model=hf_model,
