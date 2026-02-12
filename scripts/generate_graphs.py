@@ -250,7 +250,7 @@ def generate_all_graphs(
     max_feature_nodes: int = 7500,
     max_n_logits: int = 10,
     desired_logit_prob: float = 0.95,
-    batch_size: int = 512,
+    batch_size: int = 128,
     categories: list[str] | None = None,
 ) -> None:
     """Generate attribution graphs for all benchmark prompts."""
@@ -368,6 +368,8 @@ def main() -> None:
     parser.add_argument("--node-threshold", type=float, default=0.8)
     parser.add_argument("--edge-threshold", type=float, default=0.98)
     parser.add_argument("--max-feature-nodes", type=int, default=7500)
+    parser.add_argument("--batch-size", type=int, default=128,
+                        help="Features per backward pass (reduce if OOM)")
     parser.add_argument("--categories", nargs="*", default=None)
     args = parser.parse_args()
 
@@ -396,6 +398,7 @@ def main() -> None:
             node_threshold=args.node_threshold,
             edge_threshold=args.edge_threshold,
             max_feature_nodes=args.max_feature_nodes,
+            batch_size=args.batch_size,
             categories=args.categories,
         )
 
