@@ -1,182 +1,311 @@
 #!/usr/bin/env python3
 """Phase 3 — Collect top activating examples for each transcoder feature.
 
-Runs the replacement model on a diverse corpus and records:
-- Top-N activating examples per feature (context + activation value)
-- Activation frequency per feature
-- Max activation value per feature
+Runs the model on a diverse corpus, hooks transcoders into MLP layers,
+and records top-N activating examples per feature with context.
 
 Output is saved as JSON per layer for downstream autointerp labeling.
 
 Usage:
-    python scripts/collect_activations.py --transcoder-dir checkpoints
-                                          --output-dir results/features/activations
-                                          [--n-examples 20]
-                                          [--corpus-tokens 50000000]
+    python scripts/collect_activations.py \
+        --checkpoint-base checkpoints \
+        --layers 8 9 10 11 12 13 14 15 16 17 \
+        --output-dir results/features/activations \
+        [--n-examples 20] \
+        [--corpus-tokens 5000000]
 """
 
 from __future__ import annotations
 
 import argparse
+import heapq
 import json
+import re
 import sys
 from collections import defaultdict
 from pathlib import Path
 
+import torch
+import torch.nn.functional as F
+from safetensors.torch import load_file
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from r1_interp.config import MODEL_ID, N_LAYERS
-from r1_interp.utils import ensure_dir, require_gpu
+from r1_interp.config import MODEL_ID
+from r1_interp.utils import ensure_dir
 
 
-def collect_top_activations(
-    transcoder_dir: str,
-    output_dir: Path,
+# ---------------------------------------------------------------------------
+# Transcoder (same as eval_sweep.py)
+# ---------------------------------------------------------------------------
+class Transcoder(torch.nn.Module):
+    """Load a sparsify transcoder checkpoint and run forward pass."""
+
+    def __init__(self, sae_dir: Path, device: str = "cuda"):
+        super().__init__()
+        cfg_path = sae_dir / "cfg.json"
+        weights_path = sae_dir / "sae.safetensors"
+
+        with open(cfg_path) as f:
+            self.cfg = json.load(f)
+
+        state = load_file(str(weights_path), device=device)
+        state = {k: v.bfloat16() for k, v in state.items()}
+
+        self.W_enc = state.get("W_enc", state.get("encoder.weight"))
+        self.b_enc = state.get("b_enc", state.get("encoder.bias"))
+        self.W_dec = state["W_dec"]
+        self.b_dec = state.get("b_dec", torch.zeros(self.W_dec.shape[-1], device=device))
+        self.W_skip = state.get("W_skip", None)
+
+        self.k = self.cfg.get("k", 64)
+        self.n_features = self.W_enc.shape[0]
+
+    def encode(self, x: torch.Tensor) -> torch.Tensor:
+        """Encode to sparse activations."""
+        pre_acts = x @ self.W_enc.T + self.b_enc
+        acts = F.relu(pre_acts)
+        if self.k > 0 and self.k < acts.shape[-1]:
+            topk_vals, topk_idx = acts.topk(self.k, dim=-1)
+            sparse_acts = torch.zeros_like(acts)
+            sparse_acts.scatter_(-1, topk_idx, topk_vals)
+            return sparse_acts
+        return acts
+
+
+# ---------------------------------------------------------------------------
+# Checkpoint discovery
+# ---------------------------------------------------------------------------
+def find_layer_checkpoint(base_dir: Path, layer: int) -> Path | None:
+    """Find the sae_dir for a specific layer."""
+    for entry in base_dir.iterdir():
+        if not entry.is_dir():
+            continue
+        m = re.search(rf"_L{layer}$", entry.name)
+        if m:
+            sae_dir = entry / f"layers.{layer}"
+            if (sae_dir / "sae.safetensors").exists():
+                return sae_dir
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Corpus loading
+# ---------------------------------------------------------------------------
+def load_corpus_tokens(
+    tokenizer, n_tokens: int, device: str
+) -> torch.Tensor:
+    """Load corpus tokens from openwebtext via streaming."""
+    from datasets import load_dataset
+
+    print(f"Loading {n_tokens:,} corpus tokens from openwebtext...")
+    ds = load_dataset("Skylion007/openwebtext", split="train", streaming=True)
+
+    all_tokens: list[int] = []
+    for example in ds:
+        text = example.get("text", "")
+        toks = tokenizer.encode(text, add_special_tokens=False)
+        all_tokens.extend(toks)
+        if len(all_tokens) >= n_tokens:
+            break
+
+    tokens = torch.tensor(all_tokens[:n_tokens], dtype=torch.long, device=device)
+    print(f"  Got {len(tokens):,} tokens")
+    return tokens
+
+
+# ---------------------------------------------------------------------------
+# Activation collection
+# ---------------------------------------------------------------------------
+def collect_layer_activations(
+    model,
+    tokenizer,
+    transcoder: Transcoder,
+    layer: int,
+    corpus_tokens: torch.Tensor,
     n_examples: int = 20,
-    corpus_tokens: int = 50_000_000,
-    batch_size: int = 32,
+    batch_size: int = 8,
     seq_len: int = 128,
-    min_activation_freq: float = 0.001,
-) -> None:
-    """Collect top-activating examples for every feature."""
-    import heapq
+) -> dict:
+    """Collect top-activating examples for every feature in one layer."""
 
-    import numpy as np
-    import torch
-    from transformers import AutoTokenizer
+    # Min-heap per feature: (activation_value, token_offset, context_snippet)
+    top_examples: dict[int, list] = defaultdict(list)
+    activation_count: dict[int, int] = defaultdict(int)
+    max_activation: dict[int, float] = defaultdict(float)
+    total_tokens_seen = 0
 
-    device = require_gpu()
-    ensure_dir(output_dir)
+    n_seqs = len(corpus_tokens) // seq_len
+    tokens_2d = corpus_tokens[: n_seqs * seq_len].reshape(n_seqs, seq_len)
 
-    try:
-        from circuit_tracer import ReplacementModel
-    except ImportError:
-        print("ERROR: circuit-tracer not installed.")
-        sys.exit(1)
+    # Hook to capture activations (not replace output — just observe)
+    captured_acts = {}
 
-    print(f"Loading model and transcoders from {transcoder_dir}...")
-    model = ReplacementModel.from_pretrained(MODEL_ID, transcoder_dir, device=device)
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, trust_remote_code=True)
+    def hook_fn(module, input, output):
+        x = input[0]
+        with torch.no_grad():
+            sparse_acts = transcoder.encode(x)
+            captured_acts["acts"] = sparse_acts
+        # Return original output — don't modify model behavior
+        return output
 
-    # Load tokenized corpus
-    eval_path = PROJECT_ROOT / "data" / "tokenized" / "train_tokens.npy"
-    if eval_path.exists():
-        tokens = np.load(eval_path)[:corpus_tokens]
-    else:
-        print("Pre-tokenized data not found. Run prepare_data.py first.")
-        sys.exit(1)
+    mlp = model.model.layers[layer].mlp
+    handle = mlp.register_forward_hook(hook_fn)
 
-    # Per-feature tracking: heap of (activation_value, context_text)
-    # Using min-heaps of size n_examples to keep top-N
-    n_features = model.transcoders[0].W_dec.shape[0] if hasattr(model, "transcoders") else 0
+    for i in range(0, n_seqs, batch_size):
+        batch = tokens_2d[i : i + batch_size]
+        if len(batch) == 0:
+            break
 
-    # Track per layer
-    for layer_idx in range(N_LAYERS):
-        print(f"\nProcessing layer {layer_idx}/{N_LAYERS - 1}...")
+        with torch.no_grad():
+            model(batch)
 
-        # Min-heap per feature: (activation_value, token_offset, context_snippet)
-        top_examples: dict[int, list] = defaultdict(list)
-        activation_count: dict[int, int] = defaultdict(int)
-        max_activation: dict[int, float] = defaultdict(float)
-        total_tokens_seen = 0
+        if "acts" not in captured_acts:
+            continue
 
-        for start in range(0, len(tokens) - seq_len, batch_size * seq_len):
-            batch = []
-            offsets = []
-            for b in range(batch_size):
-                offset = start + b * seq_len
-                if offset + seq_len > len(tokens):
-                    break
-                batch.append(tokens[offset : offset + seq_len])
-                offsets.append(offset)
+        layer_acts = captured_acts["acts"]  # (batch, seq_len, n_features)
 
-            if not batch:
-                break
+        # Process each position
+        for b_idx in range(layer_acts.shape[0]):
+            for pos in range(layer_acts.shape[1]):
+                active_mask = layer_acts[b_idx, pos] > 0
+                active_indices = active_mask.nonzero(as_tuple=True)[0]
 
-            input_ids = torch.tensor(batch, dtype=torch.long, device=device)
+                for feat_idx_t in active_indices:
+                    feat_idx = feat_idx_t.item()
+                    val = layer_acts[b_idx, pos, feat_idx].item()
 
-            with torch.no_grad():
-                _, activations = model.get_activations(input_ids, sparse=True)
+                    activation_count[feat_idx] += 1
+                    max_activation[feat_idx] = max(
+                        max_activation[feat_idx], val
+                    )
 
-                # activations shape: (n_layers, batch, seq_len, n_features)
-                # Extract this layer
-                layer_acts = activations[layer_idx]  # (batch, seq_len, n_features)
+                    # Context: decode surrounding tokens
+                    global_offset = (i + b_idx) * seq_len + pos
+                    ctx_start = max(0, pos - 10)
+                    ctx_end = min(seq_len, pos + 15)
+                    ctx_tokens = batch[b_idx][ctx_start:ctx_end].tolist()
+                    context = tokenizer.decode(ctx_tokens)
 
-                for b_idx in range(layer_acts.shape[0]):
-                    for pos in range(layer_acts.shape[1]):
-                        active = layer_acts[b_idx, pos].nonzero(as_tuple=True)[0]
-                        for feat_idx in active:
-                            feat_idx = feat_idx.item()
-                            val = layer_acts[b_idx, pos, feat_idx].item()
+                    entry = (val, global_offset, context)
+                    if len(top_examples[feat_idx]) < n_examples:
+                        heapq.heappush(top_examples[feat_idx], entry)
+                    elif val > top_examples[feat_idx][0][0]:
+                        heapq.heapreplace(top_examples[feat_idx], entry)
 
-                            activation_count[feat_idx] += 1
-                            max_activation[feat_idx] = max(max_activation[feat_idx], val)
+        total_tokens_seen += batch.numel()
+        if total_tokens_seen % 500_000 < batch_size * seq_len:
+            print(f"    {total_tokens_seen:,} tokens processed...")
 
-                            # Context: decode surrounding tokens
-                            ctx_start = max(0, pos - 5)
-                            ctx_end = min(seq_len, pos + 10)
-                            ctx_tokens = batch[b_idx][ctx_start:ctx_end].tolist()
-                            context = tokenizer.decode(ctx_tokens)
+    handle.remove()
 
-                            entry = (val, offsets[b_idx] + pos, context)
-                            if len(top_examples[feat_idx]) < n_examples:
-                                heapq.heappush(top_examples[feat_idx], entry)
-                            elif val > top_examples[feat_idx][0][0]:
-                                heapq.heapreplace(top_examples[feat_idx], entry)
+    # Build output
+    layer_data = {
+        "layer": layer,
+        "total_tokens": total_tokens_seen,
+        "n_features": transcoder.n_features,
+        "n_active_features": len(activation_count),
+        "features": {},
+    }
 
-            total_tokens_seen += input_ids.numel()
-            if total_tokens_seen % 1_000_000 < batch_size * seq_len:
-                print(f"  {total_tokens_seen:,} tokens processed...")
-
-        # Save results for this layer
-        layer_data = {
-            "layer": layer_idx,
-            "total_tokens": total_tokens_seen,
-            "n_active_features": len(activation_count),
-            "features": {},
+    for feat_idx in sorted(activation_count.keys()):
+        freq = activation_count[feat_idx] / max(total_tokens_seen, 1)
+        examples = sorted(top_examples[feat_idx], key=lambda x: -x[0])
+        layer_data["features"][str(feat_idx)] = {
+            "activation_frequency": freq,
+            "max_activation": max_activation[feat_idx],
+            "activation_count": activation_count[feat_idx],
+            "top_examples": [
+                {"activation": e[0], "token_offset": e[1], "context": e[2]}
+                for e in examples
+            ],
         }
 
-        for feat_idx in sorted(activation_count.keys()):
-            freq = activation_count[feat_idx] / max(total_tokens_seen, 1)
-            if freq < min_activation_freq:
-                continue
-
-            examples = sorted(top_examples[feat_idx], key=lambda x: -x[0])
-            layer_data["features"][str(feat_idx)] = {
-                "activation_frequency": freq,
-                "max_activation": max_activation[feat_idx],
-                "activation_count": activation_count[feat_idx],
-                "top_examples": [
-                    {"activation": e[0], "token_offset": e[1], "context": e[2]}
-                    for e in examples
-                ],
-            }
-
-        out_path = output_dir / f"activations_layer{layer_idx}.json"
-        with open(out_path, "w") as f:
-            json.dump(layer_data, f, indent=2)
-        print(f"  Saved {len(layer_data['features'])} features -> {out_path}")
+    return layer_data
 
 
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Collect top activating examples per feature"
     )
-    parser.add_argument("--transcoder-dir", required=True)
-    parser.add_argument("--output-dir", type=Path, default=Path("results/features/activations"))
+    parser.add_argument("--checkpoint-base", type=Path, default=Path("checkpoints"))
+    parser.add_argument(
+        "--layers",
+        type=int,
+        nargs="+",
+        default=list(range(8, 18)),
+        help="Layers to collect activations for (default: 8-17)",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=Path("results/features/activations"),
+    )
     parser.add_argument("--n-examples", type=int, default=20)
-    parser.add_argument("--corpus-tokens", type=int, default=50_000_000)
-    parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument("--corpus-tokens", type=int, default=5_000_000)
+    parser.add_argument("--batch-size", type=int, default=8)
     args = parser.parse_args()
 
-    collect_top_activations(
-        transcoder_dir=args.transcoder_dir,
-        output_dir=args.output_dir,
-        n_examples=args.n_examples,
-        corpus_tokens=args.corpus_tokens,
-        batch_size=args.batch_size,
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    ensure_dir(args.output_dir)
+
+    # Load model
+    print(f"Loading model {MODEL_ID}...")
+    model = AutoModelForCausalLM.from_pretrained(
+        MODEL_ID,
+        torch_dtype=torch.bfloat16,
+        device_map=device,
+        trust_remote_code=True,
     )
+    model.eval()
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, trust_remote_code=True)
+
+    # Load corpus
+    corpus_tokens = load_corpus_tokens(tokenizer, args.corpus_tokens, device)
+
+    # Process each layer
+    for layer in args.layers:
+        print(f"\n{'='*60}")
+        print(f"Layer {layer}")
+        print(f"{'='*60}")
+
+        sae_dir = find_layer_checkpoint(args.checkpoint_base, layer)
+        if sae_dir is None:
+            print(f"  No checkpoint found for layer {layer}, skipping")
+            continue
+
+        transcoder = Transcoder(sae_dir, device=device)
+        print(f"  Loaded transcoder: {transcoder.n_features} features, k={transcoder.k}")
+
+        layer_data = collect_layer_activations(
+            model,
+            tokenizer,
+            transcoder,
+            layer,
+            corpus_tokens,
+            n_examples=args.n_examples,
+            batch_size=args.batch_size,
+        )
+
+        out_path = args.output_dir / f"activations_layer{layer}.json"
+        with open(out_path, "w") as f:
+            json.dump(layer_data, f, indent=2)
+
+        n_active = layer_data["n_active_features"]
+        n_total = layer_data["n_features"]
+        print(f"  Active features: {n_active}/{n_total} ({n_active/n_total:.1%})")
+        print(f"  Saved -> {out_path}")
+
+        # Free GPU memory
+        del transcoder
+        torch.cuda.empty_cache()
+
+    print("\nDone! Run autointerp.py next to label features.")
 
 
 if __name__ == "__main__":
