@@ -231,10 +231,12 @@ def load_model_with_transcoders(transcoder_dir: str, device: torch.device):
         device=device,
         dtype=torch.bfloat16,
         hf_model=hf_model,
-        # Required: circuit-tracer hooks rely on hook_mlp_in firing,
-        # but TransformerLens disables it by default to save memory.
-        use_hook_mlp_in=True,
     )
+
+    # circuit-tracer registers permanent hooks on hook_mlp_in for skip connections,
+    # but TransformerLens only calls hook_mlp_in when this config flag is True.
+    # Setting it after construction works because the flag is checked at runtime.
+    model.cfg.use_hook_mlp_in = True
 
     return model
 
