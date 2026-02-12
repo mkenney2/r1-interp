@@ -124,6 +124,7 @@ async def label_layer(
     model: str,
     max_concurrent: int,
     resume: bool = False,
+    min_frequency: float = 0.0,
 ) -> dict:
     """Label all features for a single layer."""
     import anthropic
@@ -147,6 +148,7 @@ async def label_layer(
         idx: feat
         for idx, feat in features.items()
         if idx not in existing
+        and feat.get("activation_frequency", 0) >= min_frequency
     }
 
     if not to_label:
@@ -190,10 +192,11 @@ async def label_layer(
 def label_all_layers(
     activations_dir: Path,
     output_dir: Path,
-    model: str = "claude-sonnet-4-5-20250929",
+    model: str = "claude-haiku-4-5-20251001",
     max_concurrent: int = 10,
     layer: int | None = None,
     resume: bool = False,
+    min_frequency: float = 0.0,
 ) -> None:
     """Run autointerp labeling on all (or specified) layers."""
     ensure_dir(output_dir)
@@ -214,7 +217,7 @@ def label_all_layers(
         out_file = output_dir / act_file.name.replace("activations_", "labels_")
         asyncio.run(
             label_layer(
-                act_file, out_file, model, max_concurrent, resume
+                act_file, out_file, model, max_concurrent, resume, min_frequency
             )
         )
 
@@ -244,10 +247,16 @@ def main() -> None:
         type=Path,
         default=Path("results/features/labels"),
     )
-    parser.add_argument("--model", default="claude-sonnet-4-5-20250929")
+    parser.add_argument("--model", default="claude-haiku-4-5-20251001")
     parser.add_argument("--max-concurrent", type=int, default=10)
     parser.add_argument("--layer", type=int, default=None)
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument(
+        "--min-frequency",
+        type=float,
+        default=0.0,
+        help="Skip features with activation frequency below this threshold (e.g. 0.001 = 0.1%%)",
+    )
     args = parser.parse_args()
 
     if args.config:
@@ -262,6 +271,7 @@ def main() -> None:
             max_concurrent=cfg.max_concurrent_requests,
             layer=args.layer,
             resume=args.resume,
+            min_frequency=args.min_frequency,
         )
     else:
         label_all_layers(
@@ -271,6 +281,7 @@ def main() -> None:
             max_concurrent=args.max_concurrent,
             layer=args.layer,
             resume=args.resume,
+            min_frequency=args.min_frequency,
         )
 
 
