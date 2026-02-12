@@ -227,59 +227,69 @@ def collect_all_layers(
                 st["max_activation"], batch_max.cpu()
             )
 
-            # --- Smart heap updates ---
-            # Only process features where batch_max > current heap minimum
-            # (or heap isn't full yet)
-            heap_mins_dev = st["heap_mins"].to(device)
-            needs_update = batch_max.to(device) > heap_mins_dev
-            needs_update &= (batch_max.to(device) > 0)
+            # --- Smart heap updates (position-centric, not feature-centric) ---
+            # Instead of looping over ~49K features each doing a tensor comparison,
+            # flatten everything to CPU and do one vectorized filter pass.
+            topk_vals_cpu = topk_vals.cpu()
+            topk_idx_cpu = topk_idx.cpu()
+            batch_cpu = batch.cpu()
 
-            # Also update features whose heaps aren't full yet
-            not_full_dev = ~st["heap_full"].to(device)
-            has_activations = counts.to(device) > 0
-            needs_update |= (not_full_dev & has_activations)
+            # Precompute batch/position indices for the flat representation
+            K = tc.k
+            batch_indices = torch.arange(B).view(B, 1, 1).expand(B, seq_len, K)
+            pos_indices = torch.arange(seq_len).view(1, seq_len, 1).expand(B, seq_len, K)
 
-            update_features = needs_update.nonzero(as_tuple=True)[0]
+            flat_feat = topk_idx_cpu.reshape(-1)
+            flat_val = topk_vals_cpu.reshape(-1).float()
+            flat_batch = batch_indices.reshape(-1)
+            flat_pos = pos_indices.reshape(-1)
 
-            for f_idx_t in update_features:
-                f_idx = f_idx_t.item()
+            # Filter 1: only active entries (val > 0)
+            active = flat_val > 0
+            if not active.any():
+                continue
+
+            # Filter 2: only entries that can beat current heap min (or heap not full)
+            active_feat = flat_feat[active]
+            active_val = flat_val[active]
+            min_for_feat = st["heap_mins"][active_feat]
+            full_for_feat = st["heap_full"][active_feat]
+            can_update = (active_val > min_for_feat) | ~full_for_feat
+
+            if not can_update.any():
+                continue
+
+            # Get qualifying entries — convert to Python lists for fast iteration
+            qual_mask = active.clone()
+            active_indices = active.nonzero(as_tuple=True)[0]
+            qual_global = active_indices[can_update]
+
+            feat_list = flat_feat[qual_global].tolist()
+            val_list = flat_val[qual_global].tolist()
+            batch_list = flat_batch[qual_global].tolist()
+            pos_list = flat_pos[qual_global].tolist()
+
+            for f_idx, val, b_idx, pos in zip(feat_list, val_list, batch_list, pos_list):
                 heap = st["heaps"][f_idx]
-                min_val = st["heap_mins"][f_idx].item()
 
-                # Find positions in this batch where feature f_idx is in the topk
-                feat_match = (topk_idx == f_idx)  # (B, S, k)
-                feat_active = feat_match & (topk_vals > max(min_val, 0))
-
-                if not feat_active.any():
+                # Re-check (heap min may have been raised by earlier entry in this batch)
+                if len(heap) >= n_examples and val <= heap[0][0]:
                     continue
 
-                # Get (b, s, k_slot) positions
-                positions = feat_active.nonzero(as_tuple=False)  # (N, 3)
+                global_offset = (batch_i + b_idx) * seq_len + pos
+                ctx_start = max(0, pos - 10)
+                ctx_end = min(seq_len, pos + 15)
+                ctx_tokens = tuple(batch_cpu[b_idx][ctx_start:ctx_end].tolist())
 
-                for pos_entry in positions:
-                    b_idx = pos_entry[0].item()
-                    pos = pos_entry[1].item()
-                    k_slot = pos_entry[2].item()
-                    val = topk_vals[b_idx, pos, k_slot].item()
-
-                    if val <= 0:
-                        continue
-
-                    # Store raw token tuple (decode later at save time)
-                    global_offset = (batch_i + b_idx) * seq_len + pos
-                    ctx_start = max(0, pos - 10)
-                    ctx_end = min(seq_len, pos + 15)
-                    ctx_tokens = tuple(batch[b_idx][ctx_start:ctx_end].tolist())
-
-                    entry = (val, global_offset, ctx_tokens)
-                    if len(heap) < n_examples:
-                        heapq.heappush(heap, entry)
-                        if len(heap) == n_examples:
-                            st["heap_full"][f_idx] = True
-                            st["heap_mins"][f_idx] = heap[0][0]
-                    elif val > heap[0][0]:
-                        heapq.heapreplace(heap, entry)
+                entry = (val, global_offset, ctx_tokens)
+                if len(heap) < n_examples:
+                    heapq.heappush(heap, entry)
+                    if len(heap) == n_examples:
+                        st["heap_full"][f_idx] = True
                         st["heap_mins"][f_idx] = heap[0][0]
+                elif val > heap[0][0]:
+                    heapq.heapreplace(heap, entry)
+                    st["heap_mins"][f_idx] = heap[0][0]
 
         total_tokens += batch.numel()
         elapsed = time.time() - t_start
